@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Run thesis-validation code in the research sandbox (Docker: safe, no network, numpy/scipy).
+# ATLAS uses this to execute and prove/disprove the thesis.
+# Usage: atlas-run-sandbox <path_to_script.py> [timeout_seconds]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ATLAS_WORKSPACE_ROOT="${ATLAS_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+OPERATOR_ROOT="${OPERATOR_ROOT:-/root/operator}"
+
+SCRIPT_PATH="${1:-}"
+TIMEOUT="${2:-30}"
+MISSION_ID="${JUNE_MISSION_ID:-}"
+DISPATCH_ID="${JUNE_DISPATCH_ID:-}"
+PROJECT_ID="${JUNE_PROJECT_ID:-${ATLAS_OPERATOR_PROJECT_ID:-}}"
+ATTEMPT_ID="atlas-sandbox-$(date +%Y%m%d-%H%M%S)-${RANDOM}"
+BASE_LOG_DIR="$ATLAS_WORKSPACE_ROOT/logs/sandbox"
+mkdir -p "$BASE_LOG_DIR"
+TS="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="$BASE_LOG_DIR/${TS}-run"
+mkdir -p "$RUN_DIR"
+LOG_FILE="$RUN_DIR/run.log"
+SUMMARY_FILE="$RUN_DIR/summary.txt"
+
+usage() {
+  echo "Usage: atlas-run-sandbox <path_to_script.py> [timeout_seconds]" >&2
+  exit 2
+}
+
+if [[ -z "$SCRIPT_PATH" || "$SCRIPT_PATH" == "-h" || "$SCRIPT_PATH" == "--help" ]]; then
+  usage
+fi
+
+if [[ ! -f "$SCRIPT_PATH" ]]; then
+  echo "error=file_not_found path=$SCRIPT_PATH" >> "$SUMMARY_FILE"
+  echo "RUN_DIR=$RUN_DIR"
+  echo "SUMMARY_FILE=$SUMMARY_FILE"
+  echo "SANDBOX_EXIT_CODE=1"
+  echo "SANDBOX_SUCCESS=false"
+  exit 1
+fi
+
+{
+  echo "timestamp=$(date -Is)"
+  echo "script_path=$SCRIPT_PATH"
+  echo "timeout=$TIMEOUT"
+  echo "command=$OPERATOR_ROOT/bin/oc-atlas-sandbox-run-code $SCRIPT_PATH $TIMEOUT"
+  echo "---"
+} > "$LOG_FILE"
+
+# Run in sandbox; capture JSON from stdout (stderr to log) and exit code
+set +e
+JSON="$("$OPERATOR_ROOT/bin/oc-atlas-sandbox-run-code" "$SCRIPT_PATH" "$TIMEOUT" 2>> "$LOG_FILE")"
+EXIT_CODE=$?
+set -e
+echo "$JSON" >> "$LOG_FILE"
+# Success = runner exited 0 and JSON says success
+if [[ "$EXIT_CODE" -eq 0 ]] && echo "$JSON" | grep -q '"success"\s*:\s*true'; then
+  SUCCESS="true"
+else
+  SUCCESS="false"
+fi
+
+# Parse JSON for summary (optional; jq may not be installed)
+if command -v jq >/dev/null 2>&1; then
+  echo "sandbox_exit_code=$(echo "$JSON" | jq -r '.exit_code // .')" >> "$SUMMARY_FILE"
+  echo "sandbox_timeout=$(echo "$JSON" | jq -r '.timeout // false')" >> "$SUMMARY_FILE"
+  echo "sandbox_success=$(echo "$JSON" | jq -r '.success // false')" >> "$SUMMARY_FILE"
+else
+  echo "sandbox_exit_code=$EXIT_CODE" >> "$SUMMARY_FILE"
+  echo "sandbox_success=$SUCCESS" >> "$SUMMARY_FILE"
+fi
+echo "mission_id=$MISSION_ID" >> "$SUMMARY_FILE"
+echo "dispatch_id=$DISPATCH_ID" >> "$SUMMARY_FILE"
+echo "attempt_id=$ATTEMPT_ID" >> "$SUMMARY_FILE"
+echo "project_id=$PROJECT_ID" >> "$SUMMARY_FILE"
+echo "run_dir=$RUN_DIR" >> "$SUMMARY_FILE"
+echo "log_file=$LOG_FILE" >> "$SUMMARY_FILE"
+
+echo "MISSION_ID=$MISSION_ID"
+echo "PROJECT_ID=$PROJECT_ID"
+echo "DISPATCH_ID=$DISPATCH_ID"
+echo "ATTEMPT_ID=$ATTEMPT_ID"
+echo "RUN_DIR=$RUN_DIR"
+echo "SUMMARY_FILE=$SUMMARY_FILE"
+echo "SANDBOX_EXIT_CODE=$EXIT_CODE"
+echo "SANDBOX_SUCCESS=$SUCCESS"
+[[ "$SUCCESS" == "true" ]] || exit 1

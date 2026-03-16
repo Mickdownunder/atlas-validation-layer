@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ATLAS_WORKSPACE_ROOT="${ATLAS_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+OPERATOR_ROOT="${OPERATOR_ROOT:-/root/operator}"
+
+BASE_LOG_DIR="$ATLAS_WORKSPACE_ROOT/logs/seq"
+DISPATCH_LOCK_DIR="$ATLAS_WORKSPACE_ROOT/logs/dispatch"
+mkdir -p "$BASE_LOG_DIR" "$DISPATCH_LOCK_DIR"
+
+usage() {
+  cat <<USAGE
+Usage:
+  atlas-sandbox-run <status|research|full|mini> [request_text]
+USAGE
+}
+
+is_probe_request() {
+  local text="$1"
+  [[ "$text" =~ validation|probe|stack-check|stack_check|consistency|smoke|blitz|flow|failpath|gate\ probe|long-run\ mission-control ]]
+}
+
+if [[ ${1:-} == "" || ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+PLAN="$1"
+REQUEST_TEXT="${2:-}"
+MISSION_ID="${ATLAS_MISSION_ID:-${JUNE_MISSION_ID:-}}"
+DISPATCH_ID="${ATLAS_DISPATCH_ID:-${JUNE_DISPATCH_ID:-}}"
+PROJECT_ID="${ATLAS_OPERATOR_PROJECT_ID:-${JUNE_PROJECT_ID:-}}"
+TS="$(date +%Y%m%d-%H%M%S)"
+ATTEMPT_ID="${ATLAS_ATTEMPT_ID:-atlas-${TS}-${RANDOM}}"
+RUN_DIR="$BASE_LOG_DIR/${TS}-${PLAN}"
+mkdir -p "$RUN_DIR"
+SUMMARY_FILE="$RUN_DIR/summary.txt"
+RESULT_JSON="$RUN_DIR/atlas_validation.json"
+PROJECT_ID_FILE="$RUN_DIR/operator_project_id.txt"
+PREBOUND_PROJECT_ID="${ATLAS_OPERATOR_PROJECT_ID:-}"
+LOCK_FILE=""
+LOCK_ACQUIRED="0"
+STALE_LOCK_RECOVERED="0"
+LOCK_STALE_SEC="${ATLAS_DISPATCH_STALE_SEC:-14400}"
+
+overall="FAIL"
+reason_code=""
+terminal_reason=""
+failure_class=""
+recommendation="stop"
+
+write_atlas_result_artifact() {
+  local project_id="$PROJECT_ID"
+  if [[ -f "$PROJECT_ID_FILE" ]]; then
+    project_id="$(cat "$PROJECT_ID_FILE")"
+  fi
+  ATLAS_RESULT_PATH="$RESULT_JSON" \
+  ATLAS_MISSION_ID="$MISSION_ID" \
+  ATLAS_DISPATCH_ID="$DISPATCH_ID" \
+  ATLAS_PROJECT_ID="$project_id" \
+  ATLAS_ATTEMPT_ID="$ATTEMPT_ID" \
+  ATLAS_RUN_DIR="$RUN_DIR" \
+  ATLAS_SUMMARY_FILE="$SUMMARY_FILE" \
+  ATLAS_OVERALL="$overall" \
+  ATLAS_RECOMMENDATION="$recommendation" \
+  ATLAS_REASON_CODE="$reason_code" \
+  ATLAS_TERMINAL_REASON="$terminal_reason" \
+  ATLAS_FAILURE_CLASS="$failure_class" \
+  ATLAS_STALE_LOCK_RECOVERED="$STALE_LOCK_RECOVERED" \
+  ATLAS_WORKSPACE_ROOT="$ATLAS_WORKSPACE_ROOT" \
+  python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.environ["ATLAS_WORKSPACE_ROOT"])
+from lib.atlas_validation_contract import write_contract
+
+write_contract(
+    os.environ["ATLAS_RESULT_PATH"],
+    {
+        "mission_id": os.environ.get("ATLAS_MISSION_ID", ""),
+        "dispatch_id": os.environ.get("ATLAS_DISPATCH_ID", ""),
+        "project_id": os.environ.get("ATLAS_PROJECT_ID", ""),
+        "attempt_id": os.environ["ATLAS_ATTEMPT_ID"],
+        "run_dir": os.environ["ATLAS_RUN_DIR"],
+        "summary_file": os.environ["ATLAS_SUMMARY_FILE"],
+        "overall": os.environ["ATLAS_OVERALL"],
+        "recommendation": os.environ["ATLAS_RECOMMENDATION"],
+        "reason_code": os.environ.get("ATLAS_REASON_CODE", ""),
+        "terminal_reason": os.environ.get("ATLAS_TERMINAL_REASON", ""),
+        "failure_class": os.environ.get("ATLAS_FAILURE_CLASS", ""),
+        "stale_lock_recovered": os.environ.get("ATLAS_STALE_LOCK_RECOVERED", "0") == "1",
+    },
+)
+PY
+}
+
+release_dispatch_lock() {
+  if [[ "$LOCK_ACQUIRED" == "1" && -n "$LOCK_FILE" ]]; then
+    rm -f "$LOCK_FILE" || true
+  fi
+}
+
+emit_contract_stdout() {
+  cat <<OUT
+MISSION_ID=$MISSION_ID
+PROJECT_ID=$PROJECT_ID
+DISPATCH_ID=$DISPATCH_ID
+ATTEMPT_ID=$ATTEMPT_ID
+RUN_DIR=$RUN_DIR
+SUMMARY_FILE=$SUMMARY_FILE
+RESULT_JSON=$RESULT_JSON
+OVERALL=$overall
+RECOMMENDATION=$recommendation
+REASON_CODE=$reason_code
+TERMINAL_REASON=$terminal_reason
+FAILURE_CLASS=$failure_class
+OUT
+}
+
+validate_identity_binding() {
+  if [[ -n "$DISPATCH_ID" && -z "$MISSION_ID" ]]; then
+    DISPATCH_ID=""
+    REASON_CODE="contract_invalid"
+    TERMINAL_REASON="mission_id_required_for_dispatch_id"
+    FAILURE_CLASS="contract_failure"
+    finalize_failure
+  fi
+  if [[ -n "$MISSION_ID" && -z "$DISPATCH_ID" ]]; then
+    MISSION_ID=""
+    REASON_CODE="contract_invalid"
+    TERMINAL_REASON="dispatch_id_required_for_mission_id"
+    FAILURE_CLASS="contract_failure"
+    finalize_failure
+  fi
+}
+
+finalize_failure() {
+  write_atlas_result_artifact
+  emit_contract_stdout
+  exit 1
+}
+
+acquire_dispatch_lock() {
+  if [[ -z "$DISPATCH_ID" ]]; then
+    return 0
+  fi
+  LOCK_FILE="$DISPATCH_LOCK_DIR/${DISPATCH_ID}.lock"
+  if ( set -o noclobber; printf 'pid=%s\nts=%s\nattempt_id=%s\n' "$$" "$(date +%s)" "$ATTEMPT_ID" > "$LOCK_FILE" ) 2>/dev/null; then
+    LOCK_ACQUIRED="1"
+    return 0
+  fi
+  local existing_pid existing_ts now
+  existing_pid="$(awk -F= '/^pid=/{print $2; exit}' "$LOCK_FILE" 2>/dev/null || true)"
+  existing_ts="$(awk -F= '/^ts=/{print $2; exit}' "$LOCK_FILE" 2>/dev/null || true)"
+  now="$(date +%s)"
+  if [[ -n "$existing_pid" && -n "$existing_ts" ]] && kill -0 "$existing_pid" 2>/dev/null && (( now - existing_ts < LOCK_STALE_SEC )); then
+    reason_code="duplicate_dispatch_blocked"
+    terminal_reason="atlas_dispatch_already_active"
+    failure_class="resource_contention"
+    finalize_failure
+  fi
+  if ! rm -f "$LOCK_FILE"; then
+    reason_code="stale_lock_failed"
+    terminal_reason="atlas_dispatch_lock_recovery_failed"
+    failure_class="resource_contention"
+    finalize_failure
+  fi
+  STALE_LOCK_RECOVERED="1"
+  if ( set -o noclobber; printf 'pid=%s\nts=%s\nattempt_id=%s\n' "$$" "$(date +%s)" "$ATTEMPT_ID" > "$LOCK_FILE" ) 2>/dev/null; then
+    LOCK_ACQUIRED="1"
+    return 0
+  fi
+  reason_code="stale_lock_failed"
+  terminal_reason="atlas_dispatch_lock_recovery_failed"
+  failure_class="resource_contention"
+  finalize_failure
+}
+
+trap release_dispatch_lock EXIT
+
+if [[ -n "$PREBOUND_PROJECT_ID" ]] && [[ ! "$PREBOUND_PROJECT_ID" =~ ^proj-[A-Za-z0-9_-]+$ ]]; then
+  reason_code="contract_invalid"
+  terminal_reason="invalid_prebound_project_id"
+  failure_class="contract_failure"
+  finalize_failure
+fi
+if [[ -n "$PREBOUND_PROJECT_ID" ]]; then
+  printf '%s\n' "$PREBOUND_PROJECT_ID" > "$PROJECT_ID_FILE"
+  PROJECT_ID="$PREBOUND_PROJECT_ID"
+fi
+
+validate_identity_binding
+acquire_dispatch_lock
+
+GATE_MODE="${GATE_MODE:-strict}"
+if [[ "$REQUEST_TEXT" =~ gate=strict ]]; then
+  GATE_MODE="strict"
+elif [[ "$REQUEST_TEXT" =~ gate=warn|gate=ignore|skip_health|Gate\ ignorieren|gate\ ignorieren|smoke|blitz|flow ]]; then
+  GATE_MODE="warn"
+fi
+
+SKIP_HEALTH_GATE="0"
+if [[ "$GATE_MODE" == "warn" ]]; then
+  SKIP_HEALTH_GATE="1"
+fi
+
+PROBE_MODE="0"
+if [[ "$PLAN" =~ ^(research|full)$ ]] && is_probe_request "$REQUEST_TEXT"; then
+  PROBE_MODE="1"
+fi
+
+steps=("sandbox_policy" "sandbox_list")
+case "$PLAN" in
+  status)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    steps+=("job_status")
+    ;;
+  research)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    if [[ "$PROBE_MODE" == "1" ]]; then
+      steps+=("job_status")
+    else
+      steps+=("job_status")
+      if [[ -z "$PREBOUND_PROJECT_ID" ]]; then
+        steps+=("research_init")
+      fi
+      steps+=("research_cycle")
+    fi
+    ;;
+  full)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    if [[ "$PROBE_MODE" == "1" ]]; then
+      steps+=("job_status")
+    else
+      steps+=("job_status")
+      if [[ -z "$PREBOUND_PROJECT_ID" ]]; then
+        steps+=("research_init")
+      fi
+      steps+=("research_cycle")
+    fi
+    ;;
+  mini)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck_warn")
+    steps+=("mini_audit")
+    ;;
+  *)
+    echo "Unknown plan: $PLAN" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+run_step() {
+  local step="$1"
+  local idx="$2"
+  local log_file="$RUN_DIR/step-${idx}-${step}.log"
+  local -a cmd
+
+  case "$step" in
+    sandbox_policy)
+      cmd=(openclaw sandbox explain --agent atlas)
+      ;;
+    sandbox_list)
+      cmd=(openclaw sandbox list)
+      ;;
+    healthcheck)
+      cmd=("$OPERATOR_ROOT/bin/oc-healthcheck")
+      ;;
+    healthcheck_warn)
+      cmd=("$OPERATOR_ROOT/bin/oc-healthcheck")
+      ;;
+    job_status)
+      cmd=("$OPERATOR_ROOT/bin/oc-job-status" 20)
+      ;;
+    research_init)
+      if [[ -n "$REQUEST_TEXT" ]]; then
+        cmd=("$OPERATOR_ROOT/bin/oc-research-init" "$REQUEST_TEXT")
+      else
+        cmd=("$OPERATOR_ROOT/bin/oc-research-init")
+      fi
+      ;;
+    research_cycle)
+      if [[ ! -f "$PROJECT_ID_FILE" ]]; then
+        echo "missing_project_id" >> "$log_file"
+        echo "FAIL"
+        return 1
+      fi
+      local project_id
+      project_id="$(cat "$PROJECT_ID_FILE")"
+      cmd=("$OPERATOR_ROOT/bin/oc-research-cycle" "$project_id")
+      ;;
+    mini_audit)
+      local seed="2026"
+      if [[ "$REQUEST_TEXT" =~ seed=([0-9]+) ]]; then
+        seed="${BASH_REMATCH[1]}"
+      fi
+      cmd=(bash "$ATLAS_WORKSPACE_ROOT/bin/atlas-mini-audit" "$seed")
+      ;;
+    *)
+      echo "unknown step: $step" >&2
+      return 127
+      ;;
+  esac
+
+  {
+    echo "timestamp=$(date -Is)"
+    echo "plan=$PLAN"
+    echo "step=$step"
+    echo "probe_mode=$PROBE_MODE"
+    echo "command=${cmd[*]}"
+    echo "---"
+  } > "$log_file"
+
+  if [[ "$step" == "healthcheck_warn" ]]; then
+    "${cmd[@]}" >> "$log_file" 2>&1; ec=$?
+    if [[ $ec -ne 0 ]]; then
+      echo "healthcheck_warn=unhealthy (see step log for load_ok/disk_ok)" >> "$RUN_DIR/healthcheck_warn.txt"
+      echo "WARN"
+      return 0
+    fi
+    echo "PASS"
+    return 0
+  fi
+
+  if "${cmd[@]}" >> "$log_file" 2>&1; then
+    if [[ "$step" == "research_init" ]]; then
+      local project_id
+      project_id="$(awk -F= '/^PROJECT_ID=/{print $2; exit}' "$log_file")"
+      [[ -n "$project_id" ]] || project_id="$(grep -Eo 'proj-[A-Za-z0-9_-]+' "$log_file" | tail -n 1 || true)"
+      if [[ -z "$project_id" ]]; then
+        echo "research_init_project_id_missing=1" >> "$log_file"
+        echo "FAIL"
+        return 1
+      fi
+      printf '%s\n' "$project_id" > "$PROJECT_ID_FILE"
+      PROJECT_ID="$project_id"
+    fi
+    echo "PASS"
+    return 0
+  else
+    echo "FAIL"
+    return 1
+  fi
+}
+
+overall="PASS"
+index=0
+step_rows=()
+
+for step in "${steps[@]}"; do
+  index=$((index + 1))
+  outcome="PASS"
+  if ! run_step "$step" "$index"; then
+    outcome="FAIL"
+    overall="FAIL"
+    reason_code="atlas_step_failed"
+    terminal_reason="atlas_${step}_failed"
+    failure_class="validation_failure"
+  fi
+  log_path="$RUN_DIR/step-${index}-${step}.log"
+  step_rows+=("${index}|${step}|${outcome}|${log_path}")
+  if [[ "$outcome" == "FAIL" ]]; then
+    break
+  fi
+done
+
+recommendation="stop"
+if [[ "$overall" == "PASS" ]]; then
+  case "$PLAN" in
+    status) recommendation="more_runs" ;;
+    research|full|mini) recommendation="new_test" ;;
+    *) recommendation="new_test" ;;
+  esac
+fi
+if [[ "$overall" == "PASS" && -z "$reason_code" && "$STALE_LOCK_RECOVERED" == "1" ]]; then
+  reason_code="stale_lock_recovered"
+  terminal_reason="atlas_dispatch_lock_recovered"
+fi
+
+{
+  echo "timestamp=$(date -Is)"
+  echo "plan=$PLAN"
+  echo "request_text=$REQUEST_TEXT"
+  echo "probe_mode=$PROBE_MODE"
+  echo "gate_mode=$GATE_MODE"
+  echo "prebound_project_id=$PREBOUND_PROJECT_ID"
+  echo "mission_id=$MISSION_ID"
+  echo "dispatch_id=$DISPATCH_ID"
+  echo "attempt_id=$ATTEMPT_ID"
+  echo "project_id=$PROJECT_ID"
+  echo "run_dir=$RUN_DIR"
+  echo "result_json=$RESULT_JSON"
+  echo "overall=$overall"
+  echo "recommendation=$recommendation"
+  [[ -n "$reason_code" ]] && echo "reason_code=$reason_code"
+  [[ -n "$terminal_reason" ]] && echo "terminal_reason=$terminal_reason"
+  [[ -n "$failure_class" ]] && echo "failure_class=$failure_class"
+  if [[ -f "$PROJECT_ID_FILE" ]]; then
+    PROJECT_ID="$(cat "$PROJECT_ID_FILE")"
+    echo "operator_project_id=$PROJECT_ID"
+  fi
+  echo "steps_begin"
+  for row in "${step_rows[@]}"; do
+    echo "$row"
+  done
+  echo "steps_end"
+  [[ -f "$RUN_DIR/healthcheck_warn.txt" ]] && cat "$RUN_DIR/healthcheck_warn.txt"
+} > "$SUMMARY_FILE"
+
+write_atlas_result_artifact
+emit_contract_stdout
+
+if [[ "$overall" == "FAIL" ]]; then
+  exit 1
+fi

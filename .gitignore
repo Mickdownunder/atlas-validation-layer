@@ -1,0 +1,7 @@
+.openclaw/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.bak.*
+*.log

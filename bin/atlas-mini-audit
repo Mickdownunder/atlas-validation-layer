@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SEED="${1:-2026}"
+WAIT_SEC="${ATLAS_AUDIT_WAIT_SEC:-60}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ATLAS_WORKSPACE_ROOT="${ATLAS_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+JUNE_WORKSPACE_ROOT="${JUNE_WORKSPACE_ROOT:-/root/agent/workspace}"
+ES="$JUNE_WORKSPACE_ROOT/mini_es_seed${SEED}.log"
+RD="$JUNE_WORKSPACE_ROOT/mini_reflective_default_seed${SEED}.log"
+RS="$JUNE_WORKSPACE_ROOT/mini_reflective_strong_seed${SEED}.log"
+
+for f in "$ES" "$RD" "$RS"; do
+  if [[ ! -s "$f" ]]; then
+    echo "missing_or_empty=$f" >&2
+    exit 1
+  fi
+done
+
+is_running_seed() {
+  ps -eo cmd | grep -E "mini_policy_test.py" | grep -E -- "--seed[[:space:]]+${SEED}(\\s|$)" | grep -v grep >/dev/null 2>&1
+}
+
+parse_once() {
+python3 - "$ES" "$RD" "$RS" <<'PY'
+import ast
+import json
+import re
+import sys
+
+ERROR_RE = re.compile(r"traceback|exception|runtimeerror|moduleNotFound|missing_or_empty", re.I)
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def extract_metrics(txt):
+    candidates = []
+    for line in txt.splitlines():
+        s = line.strip()
+        if s.startswith("{") and s.endswith("}"):
+            candidates.append(s)
+    if not candidates:
+        for m in re.finditer(r"\{[\s\S]*?\}", txt):
+            s = m.group(0).strip()
+            if len(s) >= 8:
+                candidates.append(s)
+
+    for raw in reversed(candidates):
+        obj = None
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            try:
+                obj = ast.literal_eval(raw)
+            except Exception:
+                obj = None
+        if isinstance(obj, dict) and any(k in obj for k in ("final_ppl", "tokens", "wall_time")):
+            return {
+                "final_ppl": obj.get("final_ppl"),
+                "tokens": obj.get("tokens"),
+                "wall_time": obj.get("wall_time"),
+            }
+
+    final_ppl = None
+    tokens = None
+    wall_time = None
+    m = re.search(r"(?:final_ppl|val_ppl)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", txt)
+    if m:
+        final_ppl = _to_float(m.group(1))
+    m = re.search(r"tokens\s*[:=]\s*([0-9]+)", txt)
+    if m:
+        tokens = _to_int(m.group(1))
+    m = re.search(r"wall_time\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", txt)
+    if m:
+        wall_time = _to_float(m.group(1))
+    if final_ppl is None and tokens is None and wall_time is None:
+        return None
+    return {"final_ppl": final_ppl, "tokens": tokens, "wall_time": wall_time}
+
+
+parsed_count = 0
+fatal_count = 0
+incomplete_count = 0
+
+for path in sys.argv[1:]:
+    txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+    metrics = extract_metrics(txt)
+    if metrics is not None:
+        parsed_count += 1
+        print(f"{path}.final_ppl={metrics.get('final_ppl')}")
+        print(f"{path}.tokens={metrics.get('tokens')}")
+        print(f"{path}.wall_time={metrics.get('wall_time')}")
+        continue
+
+    if ERROR_RE.search(txt):
+        fatal_count += 1
+        print(f"{path}.parse=FATAL_NO_METRICS")
+    else:
+        incomplete_count += 1
+        print(f"{path}.parse=INCOMPLETE")
+
+if fatal_count > 0:
+    print("audit_status=FAIL")
+    sys.exit(2)
+if parsed_count == 0 and incomplete_count > 0:
+    print("audit_status=FAIL_ALL_INCOMPLETE")
+    sys.exit(3)
+if incomplete_count > 0:
+    print("audit_status=PASS_WITH_INCOMPLETE")
+else:
+    print("audit_status=PASS")
+PY
+}
+
+start_ts="$(date +%s)"
+while true; do
+  out=""
+  rc=0
+  out="$(parse_once 2>&1)" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    printf "%s\n" "$out"
+    echo "ATLAS_MINI_AUDIT=PASS"
+    exit 0
+  fi
+
+  now="$(date +%s)"
+  elapsed=$((now - start_ts))
+  if is_running_seed && [[ "$elapsed" -lt "$WAIT_SEC" ]]; then
+    sleep 2
+    continue
+  fi
+
+  printf "%s\n" "$out" >&2
+  exit 1
+done
