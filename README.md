@@ -1,7 +1,19 @@
-# Atlas Workspace
+# atlas-validation-layer
 
-Atlas is a bounded June-owned validation/sandbox executor. This workspace owns only local
-validation artifacts and the canonical Atlas validation contract.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Stack Setup](https://img.shields.io/badge/docs-stack%20setup-black.svg)](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/STACK_SETUP.md)
+
+`atlas-validation-layer` is the bounded validation layer of the Operator
+research stack. ATLAS runs sandboxed checks, mini-audits, and contract-shaped
+verification steps that feed back into Operator without becoming a second
+planner.
+
+## What This Repo Contains
+
+- sandbox and mini-audit entrypoints
+- Atlas validation contract logic
+- validation knowledge maps and supporting docs
+- tests for the public validation surface
 
 ## Canonical entrypoints
 - `bin/atlas-sandbox-run`
