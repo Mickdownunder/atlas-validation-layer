@@ -122,16 +122,16 @@ OUT
 validate_identity_binding() {
   if [[ -n "$DISPATCH_ID" && -z "$MISSION_ID" ]]; then
     DISPATCH_ID=""
-    REASON_CODE="contract_invalid"
-    TERMINAL_REASON="mission_id_required_for_dispatch_id"
-    FAILURE_CLASS="contract_failure"
+    reason_code="contract_invalid"
+    terminal_reason="mission_id_required_for_dispatch_id"
+    failure_class="contract_failure"
     finalize_failure
   fi
   if [[ -n "$MISSION_ID" && -z "$DISPATCH_ID" ]]; then
     MISSION_ID=""
-    REASON_CODE="contract_invalid"
-    TERMINAL_REASON="dispatch_id_required_for_mission_id"
-    FAILURE_CLASS="contract_failure"
+    reason_code="contract_invalid"
+    terminal_reason="dispatch_id_required_for_mission_id"
+    failure_class="contract_failure"
     finalize_failure
   fi
 }

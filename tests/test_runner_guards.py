@@ -52,6 +52,18 @@ class AtlasRunnerGuardTests(unittest.TestCase):
         contract = load_contract(envelope["RESULT_JSON"])
         self.assertEqual(contract["failure_class"], "resource_contention")
 
+    def test_mission_id_without_dispatch_id_fails_with_contract_invalid(self):
+        env = os.environ.copy()
+        env["ATLAS_MISSION_ID"] = "mis_test"
+        env["ATLAS_WORKSPACE_ROOT"] = str(ATLAS_ROOT)
+        proc = subprocess.run([ATLAS_BIN, "status"], text=True, capture_output=True, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        envelope = parse_envelope(proc.stdout)
+        self.assertEqual(envelope["REASON_CODE"], "contract_invalid")
+        self.assertEqual(envelope["TERMINAL_REASON"], "dispatch_id_required_for_mission_id")
+        contract = load_contract(envelope["RESULT_JSON"])
+        self.assertEqual(contract["failure_class"], "contract_failure")
+
 
 if __name__ == "__main__":
     unittest.main()
