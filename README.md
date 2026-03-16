@@ -60,3 +60,6 @@ attempt metadata, overall outcome, recommendation, and failure classification.
 
 Cross-repo wiring and environment conventions:
 [operator-control-plane/docs/STACK_SETUP.md](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/STACK_SETUP.md)
+
+Runnable bounded public demo (2-5 min):
+[operator-control-plane/docs/DEMO.md](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/DEMO.md)
